@@ -1,207 +1,201 @@
-```python
 import os
-from flask import Flask
-from flask_socketio import SocketIO, emit
+from flask import Flask, request
+from flask_socketio import SocketIO, emit, join_room, leave_room
+import uuid
 
 app = Flask(__name__)
-# すべてのオリジンからの接続を許可
+# すべてのオリジンからのアクセスを許可
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# 接続中のプレイヤー情報を保持する辞書
-# { sid: { "name": name, "points": points, "totalDamage": totalDamage, "status": "idle" } }
+# プレイヤーデータベース
+# 構造: { uid: { "uid": str, "name": str, "points": int, "total_damage": int, "online": bool, "sid": str } }
 players = {}
+sid_to_uid = {}
 
-# アクティブな決闘情報
-# { duel_id: { "challenger": sid, "target": sid, "challenger_score": 0, "target_score": 0, "timeout": ... } }
-duels = {}
+# アクティブなバトル管理
+# 構造: { battle_id: { "p1": uid, "p2": uid, "p1_dmg": 0, "p2_dmg": 0, "status": str } }
+battles = {}
 
 @app.route('/')
 def index():
-    return "Straw Doll Game Online Server is Running!"
+    return "Straw Doll Clicker Online Server is Running!"
 
 @socketio.on('connect')
 def handle_connect():
-    # 接続直後はまだ名前未登録状態
     pass
-
-@socketio.on('join_game')
-def handle_join(data):
-    sid = data.get('sid') or ""
-    # Socket.ioの実際のセッションIDを使用するか、クライアントから送られた一意のIDを使用
-    user_sid = data.get('userId') or ""
-    
-    players[user_sid] = {
-        "sid": user_sid,
-        "name": data.get("name", "名無し"),
-        "points": data.get("points", 0),
-        "totalDamage": data.get("totalDamage", 0),
-        "status": "idle",
-        "socket_id": data.get('socketId')
-    }
-    # 全員に最新のプレイヤーリストを送信
-    broadcast_players()
-
-@socketio.on('update_status')
-def handle_update(data):
-    user_sid = data.get('userId')
-    if user_sid in players:
-        players[user_sid]["points"] = data.get("points", players[user_sid]["points"])
-        players[user_sid]["totalDamage"] = data.get("totalDamage", players[user_sid]["totalDamage"])
-        broadcast_players()
-
-@socketio.on('disconnect_player')
-def handle_disconnect_player(data):
-    user_sid = data.get('userId')
-    if user_sid in players:
-        del players[user_sid]
-        broadcast_players()
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    # 実際の切断時はsocket.idに紐づくプレイヤーを削除
-    target_uid = None
-    for uid, p in list(players.items()):
-        # クライアント側の定期的な生存確認や切断処理で補完
-        pass
-
-# 決闘リクエスト
-@socketio.on('challenge_request')
-def handle_challenge(data):
-    challenger_id = data.get('challengerId')
-    target_id = data.get('targetId')
-    
-    if challenger_id in players and target_id in players:
-        # 相手が戦闘中ではないか確認
-        if players[target_id]["status"] != "idle":
-            emit('challenge_rejected', {"reason": "相手は現在戦闘中、または退席中です。"}, to=data.get('socketId'))
-            return
-            
-        players[challenger_id]["status"] = "challenging"
-        
-        # ターゲットに対戦要請を送信
-        # シンプルに全員にブロードキャストして、宛先IDが合致するクライアントでモーダルを出す
-        emit('receive_challenge', {
-            "challengerId": challenger_id,
-            "challengerName": players[challenger_id]["name"],
-            "targetId": target_id
-        }, broadcast=True)
-
-# 決闘承諾
-@socketio.on('challenge_accept')
-def handle_accept(data):
-    challenger_id = data.get('challengerId')
-    target_id = data.get('targetId')
-    
-    if challenger_id in players and target_id in players:
-        players[challenger_id]["status"] = "fighting"
-        players[target_id]["status"] = "fighting"
-        
-        duel_id = f"duel_{challenger_id}_{target_id}"
-        duels[duel_id] = {
-            "challenger": challenger_id,
-            "target": target_id,
-            "challenger_score": 0,
-            "target_score": 0
-        }
-        
-        # 決闘開始を両者に通知
-        emit('duel_start', {
-            "duelId": duel_id,
-            "challengerId": challenger_id,
-            "targetId": target_id,
-            "challengerName": players[challenger_id]["name"],
-            "targetName": players[target_id]["name"]
-        }, broadcast=True)
-        broadcast_players()
-
-# 決闘拒否
-@socketio.on('challenge_decline')
-def handle_decline(data):
-    challenger_id = data.get('challengerId')
-    if challenger_id in players:
-        players[challenger_id]["status"] = "idle"
-    emit('duel_declined', {"challengerId": challenger_id}, broadcast=True)
+    sid = request.sid
+    if sid in sid_to_uid:
+        uid = sid_to_uid[sid]
+        if uid in players:
+            players[uid]['online'] = False
+            players[uid]['sid'] = None
+        del sid_to_uid[sid]
     broadcast_players()
 
-# 決闘中のダメージ同期
-@socketio.on('duel_progress')
-def handle_duel_progress(data):
-    duel_id = data.get('duelId')
-    player_id = data.get('userId')
-    dmg = data.get('damage', 0)
-    
-    if duel_id in duels:
-        duel = duels[duel_id]
-        if duel["challenger"] == player_id:
-            duel["challenger_score"] += dmg
-        elif duel["target"] == player_id:
-            duel["target_score"] += dmg
-            
-        # リアルタイムスコアを同期
-        emit('duel_score_update', {
-            "duelId": duel_id,
-            "challengerScore": duel["challenger_score"],
-            "targetScore": duel["target_score"]
-        }, broadcast=True)
+@socketio.on('register_player')
+def handle_register(data):
+    sid = request.sid
+    uid = data.get('uid')
+    name = data.get('name', '名無しさん')
+    points = data.get('points', 0)
+    total_damage = data.get('total_damage', 0)
 
-# 決闘終了
-@socketio.on('duel_end')
-def handle_duel_end(data):
-    duel_id = data.get('duelId')
-    if duel_id in duels:
-        duel = duels[duel_id]
-        c_id = duel["challenger"]
-        t_id = duel["target"]
-        
-        if c_id in players: players[c_id]["status"] = "idle"
-        if t_id in players: players[t_id]["status"] = "idle"
-        
-        # 結果判定
-        c_score = duel["challenger_score"]
-        t_score = duel["target_score"]
-        
-        winner_id = None
-        loser_id = None
-        if c_score > t_score:
-            winner_id = c_id
-            loser_id = t_id
-        elif t_score > c_score:
-            winner_id = t_id
-            loser_id = c_id
+    # 新規か既存か
+    if not uid:
+        uid = str(uuid.uuid4())
+
+    sid_to_uid[sid] = uid
+    
+    players[uid] = {
+        'uid': uid,
+        'sid': sid,
+        'name': name,
+        'points': points,
+        'total_damage': total_damage,
+        'online': True
+    }
+
+    emit('registration_success', {'uid': uid})
+    broadcast_players()
+
+@socketio.on('update_player_data')
+def handle_update(data):
+    sid = request.sid
+    if sid in sid_to_uid:
+        uid = sid_to_uid[sid]
+        if uid in players:
+            players[uid]['name'] = data.get('name', players[uid]['name'])
+            players[uid]['points'] = data.get('points', 0)
+            players[uid]['total_damage'] = data.get('total_damage', 0)
+            broadcast_players()
+
+@socketio.on('send_challenge')
+def handle_challenge(data):
+    sid = request.sid
+    target_uid = data.get('target_uid')
+    if sid in sid_to_uid:
+        challenger_uid = sid_to_uid[sid]
+        challenger = players.get(challenger_uid)
+        target = players.get(target_uid)
+
+        if challenger and target and target['online'] and target['sid']:
+            emit('challenge_received', {
+                'challenger_uid': challenger_uid,
+                'challenger_name': challenger['name']
+            }, to=target['sid'])
+
+@socketio.on('respond_challenge')
+def handle_response(data):
+    sid = request.sid
+    challenger_uid = data.get('challenger_uid')
+    accepted = data.get('accepted')
+
+    if sid in sid_to_uid:
+        target_uid = sid_to_uid[sid]
+        target = players.get(target_uid)
+        challenger = players.get(challenger_uid)
+
+        if challenger and target:
+            if accepted:
+                battle_id = f"battle_{challenger_uid}_{target_uid}"
+                battles[battle_id] = {
+                    'p1': challenger_uid,
+                    'p2': target_uid,
+                    'p1_dmg': 0,
+                    'p2_dmg': 0,
+                    'status': 'active'
+                }
+
+                # ルームを作成して接続
+                join_room(battle_id, sid=challenger['sid'])
+                join_room(battle_id, sid=target['sid'])
+
+                emit('battle_start', {
+                    'battle_id': battle_id,
+                    'opponent_name': target['name'],
+                    'role': 'p1'
+                }, to=challenger['sid'])
+
+                emit('battle_start', {
+                    'battle_id': battle_id,
+                    'opponent_name': challenger['name'],
+                    'role': 'p2'
+                }, to=target['sid'])
+            else:
+                if challenger['online'] and challenger['sid']:
+                    emit('challenge_rejected', {'msg': f"{target['name']}さんに断られました"}, to=challenger['sid'])
+
+@socketio.on('battle_damage')
+def handle_battle_damage(data):
+    battle_id = data.get('battle_id')
+    damage = data.get('damage', 0)
+    sid = request.sid
+
+    if battle_id in battles and sid in sid_to_uid:
+        uid = sid_to_uid[sid]
+        battle = battles[battle_id]
+
+        if battle['status'] == 'active':
+            if uid == battle['p1']:
+                battle['p1_dmg'] += damage
+            elif uid == battle['p2']:
+                battle['p2_dmg'] += damage
+
+            emit('battle_update', {
+                'p1_dmg': battle['p1_dmg'],
+                'p2_dmg': battle['p2_dmg']
+            }, to=battle_id)
+
+@socketio.on('battle_timeout')
+def handle_battle_timeout(data):
+    battle_id = data.get('battle_id')
+    sid = request.sid
+
+    if battle_id in battles and sid in sid_to_uid:
+        battle = battles[battle_id]
+        if battle['status'] == 'active':
+            battle['status'] = 'finished'
             
-        # 勝敗に応じたポイント移動処理（例: 敗者からポイントの10%または最低100ptを勝者に移動）
-        point_transfer = 0
-        if winner_id and loser_id:
-            if loser_id in players and winner_id in players:
-                loser_points = players[loser_id]["points"]
-                point_transfer = int(loser_points * 0.1)
-                if point_transfer < 100:
-                    point_transfer = 100
-                if point_transfer > loser_points:
-                    point_transfer = int(loser_points)
-                
-                players[winner_id]["points"] += point_transfer
-                players[loser_id]["points"] -= point_transfer
-                
-        emit('duel_result', {
-            "duelId": duel_id,
-            "winnerId": winner_id,
-            "loserId": loser_id,
-            "transfer": point_transfer,
-            "challengerScore": c_score,
-            "targetScore": t_score
-        }, broadcast=True)
-        
-        if duel_id in duels:
-            del duels[duel_id]
-        broadcast_players()
+            p1_dmg = battle['p1_dmg']
+            p2_dmg = battle['p2_dmg']
+            winner = None
+            
+            if p1_dmg > p2_dmg:
+                winner = 'p1'
+            elif p2_dmg > p1_dmg:
+                winner = 'p2'
+            
+            emit('battle_result', {
+                'p1_dmg': p1_dmg,
+                'p2_dmg': p2_dmg,
+                'winner': winner
+            }, to=battle_id)
+
+            # ルームを解散
+            p1_player = players.get(battle['p1'])
+            p2_player = players.get(battle['p2'])
+            if p1_player and p1_player['sid']:
+                leave_room(battle_id, sid=p1_player['sid'])
+            if p2_player and p2_player['sid']:
+                leave_room(battle_id, sid=p2_player['sid'])
 
 def broadcast_players():
-    # 全クライアントに現在のオンラインプレイヤー情報を配る
-    emit('update_players', list(players.values()), broadcast=True)
+    # 全プレイヤーのリスト（sidなどのプライベートな値は除外）
+    serialized = []
+    for p in players.values():
+        serialized.append({
+            'uid': p['uid'],
+            'name': p['name'],
+            'points': p['points'],
+            'total_damage': p['total_damage'],
+            'online': p['online']
+        })
+    emit('update_players', serialized, broadcast=True)
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     socketio.run(app, host='0.0.0.0', port=port)
 
-```
